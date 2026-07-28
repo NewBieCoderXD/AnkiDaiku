@@ -1,0 +1,193 @@
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+type FrontCard = String;
+type BackCard = String;
+
+#[derive(Debug, PartialEq)]
+pub struct Card {
+  pub id: String,
+  pub dependencies: Vec<String>,
+  pub front: FrontCard,
+  pub back: BackCard,
+}
+
+fn parse_front_matter(text: &str) -> Option<(String, Vec<String>)> {
+  let text = text.trim_start();
+  if !text.starts_with("---") {
+    return None;
+  }
+
+  let after_first = &text[3..];
+  let end = after_first.find("---")?;
+  let matter = after_first[..end].trim();
+
+  let mut id = None;
+  let mut deps = Vec::new();
+
+  for line in matter.lines() {
+    let line = line.trim();
+    if let Some(val) = line.strip_prefix("id:") {
+      id = Some(val.trim().to_string());
+    } else if let Some(val) = line.strip_prefix("dependencies:") {
+      let val = val.trim();
+      if val == "[]" {
+        deps = Vec::new();
+      } else if val.starts_with('[') && val.ends_with(']') {
+        deps = val[1..val.len() - 1]
+          .split(',')
+          .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+          .filter(|s| !s.is_empty())
+          .collect();
+      }
+    }
+  }
+
+  Some((id?, deps))
+}
+
+fn strip_header<'a>(text: &'a str, header: &str) -> &'a str {
+  for line in text.lines() {
+    if line.trim() == header {
+      let idx = text.find(line).unwrap() + line.len();
+      return text[idx..].trim();
+    }
+  }
+  text.trim()
+}
+
+fn parse_card(raw: &str) -> Option<Card> {
+  let (id, dependencies) = parse_front_matter(raw)?;
+
+  let body = {
+    let trimmed = raw.trim_start();
+    let after_open = &trimmed[3..];
+    let end = after_open.find("---").unwrap();
+    &trimmed[3 + end + 3..]
+  };
+
+  let parts: Vec<&str> = body.splitn(2, "---").collect();
+  if parts.len() < 2 {
+    eprintln!("Warning: '{}' missing '---' separator between front/back, skipping", id);
+    return None;
+  }
+
+  let front = strip_header(parts[0], "# Front");
+  let back = strip_header(parts[1], "# Back");
+
+  if front.is_empty() && back.is_empty() {
+    return None;
+  }
+
+  Some(Card {
+    id,
+    dependencies,
+    front: markdown::to_html(front),
+    back: markdown::to_html(back),
+  })
+}
+
+pub fn execute(dir_path: &String) {
+  let dir = Path::new(dir_path);
+  if !dir.is_dir() {
+    eprintln!("Error: '{}' is not a directory", dir_path);
+    return;
+  }
+
+  let mut cards = Vec::new();
+  let mut seen_ids = HashSet::new();
+
+  let entries = match fs::read_dir(dir) {
+    Ok(e) => e,
+    Err(err) => {
+      eprintln!("Error reading directory: {}", err);
+      return;
+    }
+  };
+
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.extension().and_then(|e| e.to_str()) != Some("md") {
+      continue;
+    }
+
+    let content = match fs::read_to_string(&path) {
+      Ok(c) => c,
+      Err(err) => {
+        eprintln!("Error reading '{}': {}", path.display(), err);
+        continue;
+      }
+    };
+
+    match parse_card(&content) {
+      Some(card) => {
+        if !seen_ids.insert(card.id.clone()) {
+          eprintln!("Error: duplicate id '{}', skipping", card.id);
+          continue;
+        }
+        cards.push(card);
+      }
+      None => {
+        eprintln!("Warning: '{}' has no front matter, skipping", path.display());
+      }
+    }
+  }
+
+  println!("Built {} card(s) from '{}'", cards.len(), dir_path);
+  for card in &cards {
+    println!(
+      "  [{}] front: {} back: {}",
+      card.id,
+      &card.front[..card.front.len().min(40)],
+      &card.back[..card.back.len().min(40)]
+    );
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn make_card(id: &str, deps: &[&str], front: &str, back: &str) -> Card {
+    Card {
+      id: id.to_string(),
+      dependencies: deps.iter().map(|s| s.to_string()).collect(),
+      front: markdown::to_html(front),
+      back: markdown::to_html(back),
+    }
+  }
+
+  #[test]
+  fn parse_basic_card() {
+    let input = "---\nid: gg\ndependencies: []\n---\n\n# Front\n\nUm\n\n---\n\n# Back\n\nHey";
+    let card = parse_card(input).unwrap();
+    assert_eq!(card, make_card("gg", &[], "Um", "Hey"));
+  }
+
+  #[test]
+  fn parse_card_with_deps() {
+    let input = "---\nid: baz\ndependencies: [gg, foo]\n---\n\n# Front\n\nQ\n\n---\n\n# Back\n\nA";
+    let card = parse_card(input).unwrap();
+    assert_eq!(card, make_card("baz", &["gg", "foo"], "Q", "A"));
+  }
+
+  #[test]
+  fn parse_card_no_front_matter() {
+    let input = "# Front\n\nUm\n\n---\n\n# Back\n\nHey";
+    assert!(parse_card(input).is_none());
+  }
+
+  #[test]
+  fn parse_card_empty_body() {
+    let input = "---\nid: empty\ndependencies: []\n---\n\n# Front\n\n---\n\n# Back\n\n";
+    assert!(parse_card(input).is_none());
+  }
+
+  #[test]
+  fn duplicate_ids_detected() {
+    let mut seen = HashSet::new();
+    assert!(seen.insert("dup".to_string()));
+    assert!(!seen.insert("dup".to_string()));
+  }
+}
