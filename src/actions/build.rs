@@ -136,11 +136,10 @@ fn parse_card(raw: &str) -> Option<Card> {
   })
 }
 
-pub fn parse_dir(dir_path: &String) -> Vec<Card> {
+pub fn parse_dir(dir_path: &String) -> Result<Vec<Card>, String> {
   let dir = Path::new(dir_path);
   if !dir.is_dir() {
-    eprintln!("Error: '{}' is not a directory", dir_path);
-    return Vec::new();
+    return Err(format!("'{}' is not a directory", dir_path));
   }
 
   let mut cards = Vec::new();
@@ -148,10 +147,7 @@ pub fn parse_dir(dir_path: &String) -> Vec<Card> {
 
   let entries = match fs::read_dir(dir) {
     Ok(e) => e,
-    Err(err) => {
-      eprintln!("Error reading directory: {}", err);
-      return cards;
-    }
+    Err(err) => return Err(format!("Error reading directory: {}", err)),
   };
 
   for entry in entries.flatten() {
@@ -171,8 +167,7 @@ pub fn parse_dir(dir_path: &String) -> Vec<Card> {
     match parse_card(&content) {
       Some(card) => {
         if !seen_ids.insert(card.id.clone()) {
-          eprintln!("Error: duplicate id '{}', skipping", card.id);
-          continue;
+          return Err(format!("Duplicate id '{}'", card.id));
         }
         cards.push(card);
       }
@@ -182,7 +177,7 @@ pub fn parse_dir(dir_path: &String) -> Vec<Card> {
     }
   }
 
-  cards
+  Ok(cards)
 }
 
 #[cfg(test)]

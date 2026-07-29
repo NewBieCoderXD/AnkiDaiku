@@ -8,7 +8,7 @@ use sha1::{Digest, Sha1};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-use super::build::{parse_dir, Card};
+use super::build::parse_dir;
 use crate::config;
 
 fn id_from_name(name: &str) -> i64 {
@@ -63,7 +63,7 @@ fn checksum(data: &str) -> u32 {
   u32::from_str_radix(&hex_str, 16).unwrap_or(0)
 }
 
-fn combine_css(cards: &[Card]) -> String {
+fn combine_css(shared_css: &str) -> String {
   let default_css = "\
 .card {
   font-family: arial;
@@ -73,15 +73,33 @@ fn combine_css(cards: &[Card]) -> String {
   background-color: white;
 }";
 
-  let mut parts = vec![default_css.to_string()];
+  if shared_css.is_empty() {
+    default_css.to_string()
+  } else {
+    format!("{}\n\n{}", default_css, shared_css)
+  }
+}
 
-  for card in cards {
-    if !card.style.is_empty() {
-      parts.push(card.style.clone());
+fn resolve_shared_css(root: &Path, cfg: &Option<config::AnkiDaikuConfig>) -> String {
+  if let Some(cfg) = cfg {
+    if let Some(path) = &cfg.shared_css {
+      let full_path = root.join(path);
+      if let Ok(content) = fs::read_to_string(&full_path) {
+        return content;
+      }
     }
   }
 
-  parts.join("\n\n")
+  let auto_path = root.join("shared.css");
+  fs::read_to_string(auto_path).unwrap_or_default()
+}
+
+fn wrap_style(content: &str, style: &str) -> String {
+  if style.is_empty() {
+    content.to_string()
+  } else {
+    format!("<style>\n{}\n</style>\n{}", style, content)
+  }
 }
 
 fn resolve_cards_dir(root: &Path, cli_cards_dir: Option<&str>, config_cards_dir: Option<&str>) -> String {
@@ -138,15 +156,11 @@ pub fn export_apkg(
   let deck_id = id_from_name(&format!("deck_{}", name));
   let dconf_id = 1;
 
-  let cards = parse_dir(&cards_dir);
-
-  if cards.is_empty() {
-    eprintln!("No cards found in '{}'", cards_dir);
-    return Ok(());
-  }
+  let cards = parse_dir(&cards_dir).map_err(|e| format!("Build error: {}", e))?;
 
   let db_path = std::env::temp_dir().join(format!("anki_daiku_{}.db", timestamp_ms()));
-  let css = combine_css(&cards);
+  let shared_css = resolve_shared_css(root, &cfg);
+  let css = combine_css(&shared_css);
 
   {
     let conn = Connection::open(&db_path)?;
@@ -366,7 +380,9 @@ pub fn export_apkg(
       let note_id = now_ms + (i as i64) * 2;
       let card_id = note_id + 1;
       let guid = generate_guid(&card.id);
-      let flds = format!("{}\x1f{}", card.front, card.back);
+      let wrapped_front = wrap_style(&card.front, &card.style);
+      let wrapped_back = wrap_style(&card.back, &card.style);
+      let flds = format!("{}\x1f{}", wrapped_front, wrapped_back);
       let sfld = card.front.clone();
       let csum = checksum(&sfld);
       let tags = card.dependencies.join(" ");

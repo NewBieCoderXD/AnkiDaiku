@@ -11,4 +11,4 @@ Which direction does the Sun set?
 
 # Back
 
-West
+<span class="big-text">West</span>
