@@ -14,6 +14,7 @@ pub struct Card {
   pub front: FrontCard,
   pub back: BackCard,
   pub deck: String,
+  pub deleted: bool,
 }
 
 fn parse_front_matter(text: &str) -> Option<(String, Vec<String>)> {
@@ -60,7 +61,7 @@ fn strip_header<'a>(text: &'a str, header: &str) -> &'a str {
   text.trim()
 }
 
-fn md_to_html(input: &str) -> String {
+pub fn md_to_html(input: &str) -> String {
   markdown::to_html_with_options(
     input,
     &markdown::Options {
@@ -135,18 +136,22 @@ fn parse_card(raw: &str) -> Option<Card> {
     front: md_to_html(&front),
     back: md_to_html(&back),
     deck: String::new(),
+    deleted: false,
   })
 }
 
-fn collect_md_files(dir: &Path, base: &Path, cards: &mut Vec<Card>, seen_ids: &mut HashSet<String>) -> Result<(), String> {
+fn collect_md_files(dir: &Path, base: &Path, cards: &mut Vec<Card>, seen: &mut HashSet<(String, String)>) -> Result<(), String> {
   let entries = fs::read_dir(dir).map_err(|e| format!("Error reading directory: {}", e))?;
 
   for entry in entries.flatten() {
     let path = entry.path();
 
     if path.is_dir() {
-      collect_md_files(&path, base, cards, seen_ids)?;
+      collect_md_files(&path, base, cards, seen)?;
     } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+      let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+      let is_deleted = file_name.ends_with(".del.md");
+
       let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(err) => {
@@ -157,9 +162,7 @@ fn collect_md_files(dir: &Path, base: &Path, cards: &mut Vec<Card>, seen_ids: &m
 
       match parse_card(&content) {
         Some(mut card) => {
-          if !seen_ids.insert(card.id.clone()) {
-            return Err(format!("Duplicate id '{}'", card.id));
-          }
+          card.deleted = is_deleted;
 
           let rel = path.parent().unwrap().strip_prefix(base).unwrap_or(Path::new(""));
           if !rel.as_os_str().is_empty() {
@@ -167,6 +170,11 @@ fn collect_md_files(dir: &Path, base: &Path, cards: &mut Vec<Card>, seen_ids: &m
               .map(|c| c.as_os_str().to_string_lossy())
               .collect::<Vec<_>>()
               .join("::");
+          }
+
+          if !seen.insert((card.deck.clone(), card.id.clone())) {
+            let location = if card.deck.is_empty() { card.id.clone() } else { format!("{}::{}", card.deck, card.id) };
+            return Err(format!("Duplicate card '{}'", location));
           }
 
           cards.push(card);
@@ -181,18 +189,94 @@ fn collect_md_files(dir: &Path, base: &Path, cards: &mut Vec<Card>, seen_ids: &m
   Ok(())
 }
 
-pub fn parse_dir(dir_path: &String) -> Result<Vec<Card>, String> {
+pub fn parse_dir(dir_path: &str) -> Result<Vec<Card>, String> {
   let dir = Path::new(dir_path);
   if !dir.is_dir() {
     return Err(format!("'{}' is not a directory", dir_path));
   }
 
   let mut cards = Vec::new();
-  let mut seen_ids = HashSet::new();
+  let mut seen = HashSet::new();
 
-  collect_md_files(dir, dir, &mut cards, &mut seen_ids)?;
+  collect_md_files(dir, dir, &mut cards, &mut seen)?;
 
   Ok(cards)
+}
+
+fn is_del_md(path: &Path) -> bool {
+  path.file_name()
+    .and_then(|n| n.to_str())
+    .map(|n| n.ends_with(".del.md"))
+    .unwrap_or(false)
+}
+
+fn find_card_file_by_id(dir: &Path, target: &str) -> Result<std::path::PathBuf, String> {
+  let (target_deck, target_id) = if let Some(idx) = target.find("::") {
+    (Some(&target[..idx]), &target[idx + 2..])
+  } else {
+    (None, target)
+  };
+
+  let mut found = None;
+
+  fn walk(dir: &Path, target_deck: Option<&str>, target_id: &str, base: &Path, found: &mut Option<std::path::PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("Error reading directory: {}", e))?;
+    for entry in entries.flatten() {
+      if found.is_some() { break; }
+      let path = entry.path();
+      if path.is_dir() {
+        walk(&path, target_deck, target_id, base, found)?;
+      } else if path.extension().and_then(|e| e.to_str()) == Some("md") && !is_del_md(&path) {
+        if let Ok(content) = fs::read_to_string(&path) {
+          if let Some((id, _)) = parse_front_matter(&content) {
+            let rel = path.parent().unwrap().strip_prefix(base).unwrap_or(Path::new(""));
+            let deck = if rel.as_os_str().is_empty() { String::new() } else {
+              rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("::")
+            };
+            if id == target_id {
+              if let Some(td) = target_deck {
+                if deck == td || (td.is_empty() && deck.is_empty()) {
+                  *found = Some(path);
+                  break;
+                }
+              } else {
+                *found = Some(path);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
+  walk(dir, target_deck, target_id, dir, &mut found)?;
+
+  found.ok_or_else(|| format!("Card '{}' not found", target))
+}
+
+pub fn soft_delete(cards_dir: &str, target: &str) -> Result<String, String> {
+  let path = Path::new(target);
+
+  let file_path = if path.exists() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+    if is_del_md(path) {
+      return Err(format!("Card '{}' is already deleted", target));
+    }
+    path.to_path_buf()
+  } else {
+    find_card_file_by_id(Path::new(cards_dir), target)?
+  };
+
+  let parent = file_path.parent().unwrap();
+  let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+  let new_path = parent.join(format!("{}.del.md", stem));
+
+  let mut content = fs::read_to_string(&file_path).map_err(|e| format!("Failed to read: {}", e))?;
+  content.push_str("\n\n---\n\n> **This card has been deleted.**\n>\n> Edit this file to explain why.\n");
+  fs::write(&new_path, &content).map_err(|e| format!("Failed to write: {}", e))?;
+  fs::remove_file(&file_path).map_err(|e| format!("Failed to remove original: {}", e))?;
+  Ok(format!("Deleted '{}'", file_path.display()))
 }
 
 #[cfg(test)]
@@ -207,6 +291,7 @@ mod tests {
       front: md_to_html(front),
       back: md_to_html(back),
       deck: String::new(),
+      deleted: false,
     }
   }
 
@@ -255,9 +340,16 @@ mod tests {
   }
 
   #[test]
-  fn duplicate_ids_detected() {
+  fn duplicate_ids_in_same_deck_detected() {
     let mut seen = HashSet::new();
-    assert!(seen.insert("dup".to_string()));
-    assert!(!seen.insert("dup".to_string()));
+    assert!(seen.insert(("".to_string(), "dup".to_string())));
+    assert!(!seen.insert(("".to_string(), "dup".to_string())));
+  }
+
+  #[test]
+  fn same_id_in_different_decks_allowed() {
+    let mut seen = HashSet::new();
+    assert!(seen.insert(("Math".to_string(), "card-1".to_string())));
+    assert!(seen.insert(("Science".to_string(), "card-1".to_string())));
   }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -38,9 +38,14 @@ fn timestamp_secs() -> i64 {
     .as_secs() as i64
 }
 
-fn generate_guid(card_id: &str) -> String {
+fn generate_guid(deck: &str, card_id: &str) -> String {
+  let hash_input = if deck.is_empty() {
+    card_id.to_string()
+  } else {
+    format!("{}::{}", deck, card_id)
+  };
   let mut hasher = Sha1::new();
-  hasher.update(card_id.as_bytes());
+  hasher.update(hash_input.as_bytes());
   let result = hasher.finalize();
 
   const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,./:;<=>?@[]^_`{|}~\"";
@@ -114,6 +119,33 @@ fn format_size(bytes: u64) -> String {
   }
 }
 
+const MANIFEST_DIR: &str = ".ankidaiku";
+const MANIFEST_FILE: &str = "manifest.json";
+
+fn load_manifest(root: &Path) -> HashMap<String, String> {
+  let path = root.join(MANIFEST_DIR).join(MANIFEST_FILE);
+  let content = match fs::read_to_string(&path) {
+    Ok(c) => c,
+    Err(_) => return HashMap::new(),
+  };
+  serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_manifest(root: &Path, manifest: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+  let dir = root.join(MANIFEST_DIR);
+  fs::create_dir_all(&dir)?;
+  let content = serde_json::to_string_pretty(manifest)?;
+  fs::write(dir.join(MANIFEST_FILE), content)?;
+  Ok(())
+}
+
+fn prompt_confirm(msg: &str) -> bool {
+  eprint!("{} [y/N] ", msg);
+  let mut input = String::new();
+  std::io::stdin().read_line(&mut input).ok();
+  matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 fn build_decks(root_name: &str, desc: &str, cards: &[Card]) -> (HashMap<String, i64>, serde_json::Value) {
   let now = timestamp_secs();
   let dconf_id = 1;
@@ -167,7 +199,7 @@ fn build_decks(root_name: &str, desc: &str, cards: &[Card]) -> (HashMap<String, 
   (id_map, serde_json::Value::Object(decks_map))
 }
 
-fn resolve_cards_dir(root: &Path, cli_cards_dir: Option<&str>, config_cards_dir: Option<&str>) -> String {
+pub fn resolve_cards_dir(root: &Path, cli_cards_dir: Option<&str>, config_cards_dir: Option<&str>) -> String {
   if let Some(dir) = cli_cards_dir {
     return root.join(dir).to_string_lossy().to_string();
   }
@@ -177,7 +209,7 @@ fn resolve_cards_dir(root: &Path, cli_cards_dir: Option<&str>, config_cards_dir:
   root.join("cards").to_string_lossy().to_string()
 }
 
-fn resolve_config(root: &Path, config_path: Option<&str>) -> Option<config::AnkiDaikuConfig> {
+pub fn resolve_config(root: &Path, config_path: Option<&str>) -> Option<config::AnkiDaikuConfig> {
   match config_path {
     Some(path) => {
       let p = Path::new(path);
@@ -221,6 +253,25 @@ pub fn export_apkg(
   let dconf_id = 1;
 
   let cards = parse_dir(&cards_dir).map_err(|e| format!("Build error: {}", e))?;
+
+  let prev = load_manifest(root);
+  let manifest_key = |card: &Card| -> String {
+    if card.deck.is_empty() { card.id.clone() } else { format!("{}::{}", card.deck, card.id) }
+  };
+  let current_keys: HashSet<_> = cards.iter().map(|c| manifest_key(c)).collect();
+  let removed: Vec<_> = prev.keys().filter(|k| !current_keys.contains(*k)).collect();
+
+  if !removed.is_empty() {
+    eprintln!("Warning: {} card(s) from the previous export were not found:", removed.len());
+    for id in &removed {
+      eprintln!("  - {}", id);
+    }
+    eprintln!("These cards will remain orphaned in Anki.");
+    if !prompt_confirm("Continue?") {
+      eprintln!("Aborted.");
+      return Ok(());
+    }
+  }
 
   let (deck_ids, decks_json) = build_decks(&name, &desc, &cards);
   let root_deck_id = deck_ids.get(&name).copied().unwrap_or_else(|| id_from_name(&format!("deck_{}", name)));
@@ -426,7 +477,8 @@ pub fn export_apkg(
     for (i, card) in cards.iter().enumerate() {
       let note_id = now_ms + (i as i64) * 2;
       let card_id = note_id + 1;
-      let guid = generate_guid(&card.id);
+      let guid = generate_guid(&card.deck, &card.id);
+
       let wrapped_front = wrap_style(&card.front, &card.style);
       let wrapped_back = wrap_style(&card.back, &card.style);
       let flds = format!("{}\x1f{}", wrapped_front, wrapped_back);
@@ -489,7 +541,19 @@ pub fn export_apkg(
     .map(|m| m.len())
     .unwrap_or(0);
 
-  println!("Exported {} card(s) to '{}' ({})", cards.len(), output_path, format_size(file_size));
+  let total = cards.len();
+  let deleted_count = cards.iter().filter(|c| c.deleted).count();
+  let active_count = total - deleted_count;
+  println!("Exported {} card(s) ({} active, {} deleted) to '{}' ({})",
+    total, active_count, deleted_count, output_path, format_size(file_size));
+
+  let mut manifest: HashMap<String, String> = HashMap::new();
+  for card in &cards {
+    let key = if card.deck.is_empty() { card.id.clone() } else { format!("{}::{}", card.deck, card.id) };
+    manifest.insert(key, generate_guid(&card.deck, &card.id));
+  }
+  save_manifest(root, &manifest)?;
+
   Ok(())
 }
 
@@ -499,21 +563,28 @@ mod tests {
 
   #[test]
   fn generate_guid_returns_10_chars() {
-    let guid = generate_guid("test-card");
+    let guid = generate_guid("", "test-card");
     assert_eq!(guid.len(), 10);
   }
 
   #[test]
   fn generate_guid_is_deterministic() {
-    let a = generate_guid("hello");
-    let b = generate_guid("hello");
+    let a = generate_guid("deck1", "hello");
+    let b = generate_guid("deck1", "hello");
     assert_eq!(a, b);
   }
 
   #[test]
   fn generate_guid_differs_for_different_ids() {
-    let a = generate_guid("card-1");
-    let b = generate_guid("card-2");
+    let a = generate_guid("deck1", "card-1");
+    let b = generate_guid("deck1", "card-2");
+    assert_ne!(a, b);
+  }
+
+  #[test]
+  fn generate_guid_differs_for_different_decks() {
+    let a = generate_guid("Math", "card-1");
+    let b = generate_guid("Science", "card-1");
     assert_ne!(a, b);
   }
 
