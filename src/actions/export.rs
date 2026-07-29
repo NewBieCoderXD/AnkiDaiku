@@ -11,9 +11,16 @@ use zip::ZipWriter;
 use super::build::{parse_dir, Card};
 use crate::config;
 
-const MODEL_ID: i64 = 1607392319;
-const DECK_ID: i64 = 1;
-const DCONF_ID: i64 = 1;
+fn id_from_name(name: &str) -> i64 {
+  let mut hasher = Sha1::new();
+  hasher.update(name.as_bytes());
+  let result = hasher.finalize();
+  let mut num: i64 = 0;
+  for byte in result.iter().take(8) {
+    num = (num << 8) | (*byte as i64);
+  }
+  num.abs()
+}
 
 fn timestamp_ms() -> i64 {
   SystemTime::now()
@@ -127,6 +134,9 @@ pub fn export_apkg(
 
   let name = deck_name(&pkg);
   let desc = deck_desc(&pkg);
+  let model_id = id_from_name(&name);
+  let deck_id = id_from_name(&format!("deck_{}", name));
+  let dconf_id = 1;
 
   let cards = parse_dir(&cards_dir);
 
@@ -208,15 +218,17 @@ pub fn export_apkg(
       );",
     )?;
 
+    let now_mod = timestamp_secs();
+
     let models_json = serde_json::json!({
-      MODEL_ID.to_string(): {
-        "id": MODEL_ID,
+      model_id.to_string(): {
+        "id": model_id,
         "name": &name,
         "type": 0,
-        "mod": 0,
+        "mod": now_mod,
         "usn": -1,
         "sortf": 0,
-        "did": DECK_ID,
+        "did": deck_id,
         "tmpls": [{
           "name": "Card 1",
           "qfmt": "{{Front}}",
@@ -255,10 +267,10 @@ pub fn export_apkg(
     });
 
     let decks_json = serde_json::json!({
-      DECK_ID.to_string(): {
-        "id": DECK_ID,
+      deck_id.to_string(): {
+        "id": deck_id,
         "name": &name,
-        "mod": 0,
+        "mod": now_mod,
         "usn": -1,
         "lrnToday": [0, 0],
         "revToday": [0, 0],
@@ -268,15 +280,15 @@ pub fn export_apkg(
         "browserCollapsed": false,
         "desc": &desc,
         "dyn": 0,
-        "conf": DCONF_ID,
+        "conf": dconf_id,
         "extendNew": 0,
         "extendRev": 0
       }
     });
 
     let dconf_json = serde_json::json!({
-      DCONF_ID.to_string(): {
-        "id": DCONF_ID,
+      dconf_id.to_string(): {
+        "id": dconf_id,
         "mod": 0,
         "name": "Default",
         "usn": 0,
@@ -312,14 +324,14 @@ pub fn export_apkg(
     });
 
     let conf_json = serde_json::json!({
-      "activeDecks": [DECK_ID],
-      "curDeck": DECK_ID,
+      "activeDecks": [deck_id],
+      "curDeck": deck_id,
       "newSpread": 0,
       "collapseTime": 1200,
       "timeLim": 0,
       "estTimes": true,
       "dueCounts": true,
-      "curModel": MODEL_ID,
+      "curModel": model_id,
       "nextPos": 1,
       "sortType": "noteFld",
       "sortBackwards": false,
@@ -328,7 +340,6 @@ pub fn export_apkg(
       "schedVer": 1
     });
 
-    let crt = timestamp_secs();
     let now_ms = timestamp_ms();
 
     conn.execute(
@@ -336,7 +347,7 @@ pub fn export_apkg(
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
       params![
         1,
-        crt,
+        now_mod,
         now_ms,
         now_ms,
         11,
@@ -363,14 +374,14 @@ pub fn export_apkg(
       conn.execute(
         "INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![note_id, guid, MODEL_ID, crt, -1, tags, flds, sfld, csum, 0, "",],
+        params![note_id, guid, model_id, now_mod, -1, tags, flds, sfld, csum, 0, "",],
       )?;
 
       conn.execute(
         "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
-          card_id, note_id, DECK_ID, 0, now_ms, -1, 0, 0, (i as i64) + 1, 0, 0, 0, 0, 0, 0, 0, 0,
+          card_id, note_id, deck_id, 0, now_ms, -1, 0, 0, (i as i64) + 1, 0, 0, 0, 0, 0, 0, 0, 0,
           "{\"pos\":0}",
         ],
       )?;
