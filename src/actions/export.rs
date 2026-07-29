@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -222,10 +222,20 @@ fn load_manifest(root: &Path) -> HashMap<String, String> {
     Ok(c) => c,
     Err(_) => return HashMap::new(),
   };
-  serde_json::from_str(&content).unwrap_or_default()
+  match serde_json::from_str::<serde_json::Value>(&content) {
+    Ok(val) => {
+      val.get("cards")
+        .and_then(|c| c.as_object())
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+        .unwrap_or_else(|| {
+          serde_json::from_value(val).unwrap_or_default()
+        })
+    }
+    Err(_) => HashMap::new(),
+  }
 }
 
-fn save_manifest(root: &Path, manifest: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+fn save_manifest(root: &Path, manifest: &BTreeMap<String, serde_json::Value>) -> Result<(), Box<dyn std::error::Error>> {
   let dir = root.join(MANIFEST_DIR);
   fs::create_dir_all(&dir)?;
   let content = serde_json::to_string_pretty(manifest)?;
@@ -675,11 +685,14 @@ pub fn export_apkg(
   }
   println!(" to '{}' ({})", output_path, format_size(file_size));
 
-  let mut manifest: HashMap<String, String> = HashMap::new();
+  let mut manifest: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+  manifest.insert("version".to_string(), serde_json::Value::String("1".to_string()));
+  let mut cards_map = serde_json::Map::new();
   for card in &cards {
     let key = if card.deck.is_empty() { card.id.clone() } else { format!("{}::{}", card.deck, card.id) };
-    manifest.insert(key, generate_guid(&card.deck, &card.id));
+    cards_map.insert(key, serde_json::Value::String(generate_guid(&card.deck, &card.id)));
   }
+  manifest.insert("cards".to_string(), serde_json::Value::Object(cards_map));
   save_manifest(root, &manifest)?;
 
   Ok(())
