@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -8,6 +9,7 @@ use sha1::{Digest, Sha1};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
+use super::build::Card;
 use super::build::parse_dir;
 use crate::config;
 
@@ -102,6 +104,69 @@ fn wrap_style(content: &str, style: &str) -> String {
   }
 }
 
+fn format_size(bytes: u64) -> String {
+  if bytes < 1024 {
+    format!("{} B", bytes)
+  } else if bytes < 1024 * 1024 {
+    format!("{:.1} KB", bytes as f64 / 1024.0)
+  } else {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+  }
+}
+
+fn build_decks(root_name: &str, desc: &str, cards: &[Card]) -> (HashMap<String, i64>, serde_json::Value) {
+  let now = timestamp_secs();
+  let dconf_id = 1;
+  let mut paths = std::collections::HashSet::new();
+
+  for card in cards {
+    if card.deck.is_empty() {
+      paths.insert(root_name.to_string());
+    } else {
+      paths.insert(format!("{}::{}", root_name, card.deck));
+    }
+  }
+
+  let mut all = std::collections::HashSet::new();
+  for path in &paths {
+    let parts: Vec<&str> = path.split("::").collect();
+    for i in 0..parts.len() {
+      all.insert(parts[..=i].join("::"));
+    }
+  }
+
+  let mut id_map = HashMap::new();
+  let mut decks_map = serde_json::Map::new();
+
+  for path in &all {
+    let did = id_from_name(&format!("deck_{}", path));
+    id_map.insert(path.clone(), did);
+  }
+
+  for (path, &did) in &id_map {
+    let is_root = *path == *root_name;
+    decks_map.insert(did.to_string(), serde_json::json!({
+      "id": did,
+      "name": path,
+      "mod": now,
+      "usn": -1,
+      "lrnToday": [0, 0],
+      "revToday": [0, 0],
+      "newToday": [0, 0],
+      "timeToday": [0, 0],
+      "collapsed": false,
+      "browserCollapsed": false,
+      "desc": if is_root { desc } else { "" },
+      "dyn": 0,
+      "conf": dconf_id,
+      "extendNew": 0,
+      "extendRev": 0
+    }));
+  }
+
+  (id_map, serde_json::Value::Object(decks_map))
+}
+
 fn resolve_cards_dir(root: &Path, cli_cards_dir: Option<&str>, config_cards_dir: Option<&str>) -> String {
   if let Some(dir) = cli_cards_dir {
     return root.join(dir).to_string_lossy().to_string();
@@ -153,10 +218,12 @@ pub fn export_apkg(
   let name = deck_name(&pkg);
   let desc = deck_desc(&pkg);
   let model_id = id_from_name(&name);
-  let deck_id = id_from_name(&format!("deck_{}", name));
   let dconf_id = 1;
 
   let cards = parse_dir(&cards_dir).map_err(|e| format!("Build error: {}", e))?;
+
+  let (deck_ids, decks_json) = build_decks(&name, &desc, &cards);
+  let root_deck_id = deck_ids.get(&name).copied().unwrap_or_else(|| id_from_name(&format!("deck_{}", name)));
 
   let db_path = std::env::temp_dir().join(format!("anki_daiku_{}.db", timestamp_ms()));
   let shared_css = resolve_shared_css(root, &cfg);
@@ -242,7 +309,7 @@ pub fn export_apkg(
         "mod": now_mod,
         "usn": -1,
         "sortf": 0,
-        "did": deck_id,
+        "did": root_deck_id,
         "tmpls": [{
           "name": "Card 1",
           "qfmt": "{{Front}}",
@@ -277,26 +344,6 @@ pub fn export_apkg(
         "latexPost": "",
         "latexSvg": false,
         "req": [[0, "any", [0]]]
-      }
-    });
-
-    let decks_json = serde_json::json!({
-      deck_id.to_string(): {
-        "id": deck_id,
-        "name": &name,
-        "mod": now_mod,
-        "usn": -1,
-        "lrnToday": [0, 0],
-        "revToday": [0, 0],
-        "newToday": [0, 0],
-        "timeToday": [0, 0],
-        "collapsed": false,
-        "browserCollapsed": false,
-        "desc": &desc,
-        "dyn": 0,
-        "conf": dconf_id,
-        "extendNew": 0,
-        "extendRev": 0
       }
     });
 
@@ -338,8 +385,8 @@ pub fn export_apkg(
     });
 
     let conf_json = serde_json::json!({
-      "activeDecks": [deck_id],
-      "curDeck": deck_id,
+      "activeDecks": [root_deck_id],
+      "curDeck": root_deck_id,
       "newSpread": 0,
       "collapseTime": 1200,
       "timeLim": 0,
@@ -393,11 +440,18 @@ pub fn export_apkg(
         params![note_id, guid, model_id, now_mod, -1, tags, flds, sfld, csum, 0, "",],
       )?;
 
+      let card_deck = if card.deck.is_empty() {
+        root_deck_id
+      } else {
+        let path = format!("{}::{}", name, card.deck);
+        *deck_ids.get(&path).unwrap_or(&root_deck_id)
+      };
+
       conn.execute(
         "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
-          card_id, note_id, deck_id, 0, now_ms, -1, 0, 0, (i as i64) + 1, 0, 0, 0, 0, 0, 0, 0, 0,
+          card_id, note_id, card_deck, 0, now_ms, -1, 0, 0, (i as i64) + 1, 0, 0, 0, 0, 0, 0, 0, 0,
           "{\"pos\":0}",
         ],
       )?;
@@ -431,7 +485,11 @@ pub fn export_apkg(
 
   fs::remove_file(&db_path)?;
 
-  println!("Exported {} card(s) to '{}'", cards.len(), output_path);
+  let file_size = std::fs::metadata(output_path)
+    .map(|m| m.len())
+    .unwrap_or(0);
+
+  println!("Exported {} card(s) to '{}' ({})", cards.len(), output_path, format_size(file_size));
   Ok(())
 }
 

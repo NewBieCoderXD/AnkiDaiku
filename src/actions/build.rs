@@ -13,6 +13,7 @@ pub struct Card {
   pub style: StyleCard,
   pub front: FrontCard,
   pub back: BackCard,
+  pub deck: String,
 }
 
 fn parse_front_matter(text: &str) -> Option<(String, Vec<String>)> {
@@ -133,7 +134,51 @@ fn parse_card(raw: &str) -> Option<Card> {
     style,
     front: md_to_html(&front),
     back: md_to_html(&back),
+    deck: String::new(),
   })
+}
+
+fn collect_md_files(dir: &Path, base: &Path, cards: &mut Vec<Card>, seen_ids: &mut HashSet<String>) -> Result<(), String> {
+  let entries = fs::read_dir(dir).map_err(|e| format!("Error reading directory: {}", e))?;
+
+  for entry in entries.flatten() {
+    let path = entry.path();
+
+    if path.is_dir() {
+      collect_md_files(&path, base, cards, seen_ids)?;
+    } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+      let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(err) => {
+          eprintln!("Error reading '{}': {}", path.display(), err);
+          continue;
+        }
+      };
+
+      match parse_card(&content) {
+        Some(mut card) => {
+          if !seen_ids.insert(card.id.clone()) {
+            return Err(format!("Duplicate id '{}'", card.id));
+          }
+
+          let rel = path.parent().unwrap().strip_prefix(base).unwrap_or(Path::new(""));
+          if !rel.as_os_str().is_empty() {
+            card.deck = rel.components()
+              .map(|c| c.as_os_str().to_string_lossy())
+              .collect::<Vec<_>>()
+              .join("::");
+          }
+
+          cards.push(card);
+        }
+        None => {
+          eprintln!("Warning: '{}' has no front matter, skipping", path.display());
+        }
+      }
+    }
+  }
+
+  Ok(())
 }
 
 pub fn parse_dir(dir_path: &String) -> Result<Vec<Card>, String> {
@@ -145,37 +190,7 @@ pub fn parse_dir(dir_path: &String) -> Result<Vec<Card>, String> {
   let mut cards = Vec::new();
   let mut seen_ids = HashSet::new();
 
-  let entries = match fs::read_dir(dir) {
-    Ok(e) => e,
-    Err(err) => return Err(format!("Error reading directory: {}", err)),
-  };
-
-  for entry in entries.flatten() {
-    let path = entry.path();
-    if path.extension().and_then(|e| e.to_str()) != Some("md") {
-      continue;
-    }
-
-    let content = match fs::read_to_string(&path) {
-      Ok(c) => c,
-      Err(err) => {
-        eprintln!("Error reading '{}': {}", path.display(), err);
-        continue;
-      }
-    };
-
-    match parse_card(&content) {
-      Some(card) => {
-        if !seen_ids.insert(card.id.clone()) {
-          return Err(format!("Duplicate id '{}'", card.id));
-        }
-        cards.push(card);
-      }
-      None => {
-        eprintln!("Warning: '{}' has no front matter, skipping", path.display());
-      }
-    }
-  }
+  collect_md_files(dir, dir, &mut cards, &mut seen_ids)?;
 
   Ok(cards)
 }
@@ -191,6 +206,7 @@ mod tests {
       style: String::new(),
       front: md_to_html(front),
       back: md_to_html(back),
+      deck: String::new(),
     }
   }
 
