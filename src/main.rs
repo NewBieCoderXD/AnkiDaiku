@@ -4,7 +4,11 @@ use clap::{Parser, Subcommand};
 
 #[derive(Subcommand, Debug)]
 enum Actions {
-  Build { dir_path: String },
+  Build {
+    dir_path: String,
+    #[arg(short, long, default_value = "output.apkg")]
+    output: String,
+  },
 }
 
 #[derive(Parser, Debug)]
@@ -18,8 +22,11 @@ fn main() {
   let args = Args::parse();
 
   match &args.action {
-    Actions::Build { dir_path } => {
-      actions::build::execute(dir_path);
+    Actions::Build { dir_path, output } => {
+      if let Err(e) = actions::export::export_apkg(dir_path, output) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+      }
     }
   }
 }

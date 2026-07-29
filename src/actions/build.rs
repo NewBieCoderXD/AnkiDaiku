@@ -4,11 +4,13 @@ use std::path::Path;
 
 type FrontCard = String;
 type BackCard = String;
+type StyleCard = String;
 
 #[derive(Debug, PartialEq)]
 pub struct Card {
   pub id: String,
   pub dependencies: Vec<String>,
+  pub style: StyleCard,
   pub front: FrontCard,
   pub back: BackCard,
 }
@@ -57,6 +59,20 @@ fn strip_header<'a>(text: &'a str, header: &str) -> &'a str {
   text.trim()
 }
 
+fn md_to_html(input: &str) -> String {
+  markdown::to_html_with_options(
+    input,
+    &markdown::Options {
+      compile: markdown::CompileOptions {
+        allow_dangerous_html: true,
+        ..markdown::CompileOptions::default()
+      },
+      ..markdown::Options::default()
+    },
+  )
+  .unwrap()
+}
+
 fn parse_card(raw: &str) -> Option<Card> {
   let (id, dependencies) = parse_front_matter(raw)?;
 
@@ -67,14 +83,45 @@ fn parse_card(raw: &str) -> Option<Card> {
     &trimmed[3 + end + 3..]
   };
 
-  let parts: Vec<&str> = body.splitn(2, "---").collect();
-  if parts.len() < 2 {
-    eprintln!("Warning: '{}' missing '---' separator between front/back, skipping", id);
-    return None;
-  }
+  let parts: Vec<&str> = body.splitn(3, "---").collect();
 
-  let front = strip_header(parts[0], "# Front");
-  let back = strip_header(parts[1], "# Back");
+  let (style, front, back) = match parts.len() {
+    3 => {
+      let s = strip_header(parts[0], "# Style");
+      let f = strip_header(parts[1], "# Front");
+      let b = strip_header(parts[2], "# Back");
+      (s.to_string(), f.to_string(), b.to_string())
+    }
+    2 => {
+      let part0 = parts[0];
+      if let Some(style_idx) = part0.find("# Style") {
+        if let Some(front_idx) = part0.find("# Front") {
+          if style_idx < front_idx {
+            let s = strip_header(&part0[..front_idx], "# Style");
+            let f = strip_header(&part0[front_idx..], "# Front");
+            let b = strip_header(parts[1], "# Back");
+            (s.to_string(), f.to_string(), b.to_string())
+          } else {
+            let f = strip_header(parts[0], "# Front");
+            let b = strip_header(parts[1], "# Back");
+            (String::new(), f.to_string(), b.to_string())
+          }
+        } else {
+          let f = strip_header(parts[0], "# Front");
+          let b = strip_header(parts[1], "# Back");
+          (String::new(), f.to_string(), b.to_string())
+        }
+      } else {
+        let f = strip_header(parts[0], "# Front");
+        let b = strip_header(parts[1], "# Back");
+        (String::new(), f.to_string(), b.to_string())
+      }
+    }
+    _ => {
+      eprintln!("Warning: '{}' missing '---' separator between front/back, skipping", id);
+      return None;
+    }
+  };
 
   if front.is_empty() && back.is_empty() {
     return None;
@@ -83,16 +130,17 @@ fn parse_card(raw: &str) -> Option<Card> {
   Some(Card {
     id,
     dependencies,
-    front: markdown::to_html(front),
-    back: markdown::to_html(back),
+    style,
+    front: md_to_html(&front),
+    back: md_to_html(&back),
   })
 }
 
-pub fn execute(dir_path: &String) {
+pub fn parse_dir(dir_path: &String) -> Vec<Card> {
   let dir = Path::new(dir_path);
   if !dir.is_dir() {
     eprintln!("Error: '{}' is not a directory", dir_path);
-    return;
+    return Vec::new();
   }
 
   let mut cards = Vec::new();
@@ -102,7 +150,7 @@ pub fn execute(dir_path: &String) {
     Ok(e) => e,
     Err(err) => {
       eprintln!("Error reading directory: {}", err);
-      return;
+      return cards;
     }
   };
 
@@ -134,15 +182,7 @@ pub fn execute(dir_path: &String) {
     }
   }
 
-  println!("Built {} card(s) from '{}'", cards.len(), dir_path);
-  for card in &cards {
-    println!(
-      "  [{}] front: {} back: {}",
-      card.id,
-      &card.front[..card.front.len().min(40)],
-      &card.back[..card.back.len().min(40)]
-    );
-  }
+  cards
 }
 
 #[cfg(test)]
@@ -153,8 +193,9 @@ mod tests {
     Card {
       id: id.to_string(),
       dependencies: deps.iter().map(|s| s.to_string()).collect(),
-      front: markdown::to_html(front),
-      back: markdown::to_html(back),
+      style: String::new(),
+      front: md_to_html(front),
+      back: md_to_html(back),
     }
   }
 
@@ -182,6 +223,24 @@ mod tests {
   fn parse_card_empty_body() {
     let input = "---\nid: empty\ndependencies: []\n---\n\n# Front\n\n---\n\n# Back\n\n";
     assert!(parse_card(input).is_none());
+  }
+
+  #[test]
+  fn parse_card_with_style() {
+    let input = "---\nid: styled\ndependencies: []\n---\n\n# Style\n\n.card { font-size: 20px; }\n\n# Front\n\nWhat?\n\n---\n\n# Back\n\nAnswer";
+    let card = parse_card(input).unwrap();
+    assert_eq!(card.id, "styled");
+    assert_eq!(card.style, ".card { font-size: 20px; }");
+    assert_eq!(card.front, md_to_html("What?"));
+    assert_eq!(card.back, md_to_html("Answer"));
+  }
+
+  #[test]
+  fn parse_card_with_multiline_style() {
+    let input = "---\nid: styled2\ndependencies: []\n---\n\n# Style\n\n.card {\n  font-family: arial;\n  font-size: 20px;\n  text-align: center;\n  color: black;\n  background-color: white;\n}\n\n.nightMode .card {\n  background-color: #333;\n}\n\n# Front\n\nQ\n\n---\n\n# Back\n\nA";
+    let card = parse_card(input).unwrap();
+    assert!(card.style.contains(".card {"));
+    assert!(card.style.contains(".nightMode"));
   }
 
   #[test]
