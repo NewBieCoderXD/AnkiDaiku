@@ -50,6 +50,32 @@ Create `shared.css` in the repo root, or configure via `ankidaiku.config.json`:
 
 The CSS is merged into the global Anki notetype CSS.
 
+## Media files
+
+Cards can reference images, audio, or video. Place media files in the `media/` directory:
+
+```
+media/
+  cat.png               # referenced as ![cat](cat.png)
+  lesson1.mp3           # referenced as <audio src="lesson1.mp3">
+```
+
+Media paths are resolved relative to this directory only — media lives separate from cards so it can be shared across decks.
+
+The media directory defaults to `media/` alongside `cards/`. Configure via `ankidaiku.config.json`:
+
+```json
+{
+  "media_dir": "assets/media"
+}
+```
+
+**Collision rules:**
+- Different HTML paths (`pic.png` vs `assets/pic.png`) resolving to the same file are merged into one media entry
+- Different files with the same basename trigger an error
+
+Media files are bundled inside the `.apkg` with integer IDs. Anki maps filenames automatically.
+
 ## Soft delete
 
 ```

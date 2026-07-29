@@ -34,4 +34,4 @@ What is the capital of **France**?
 
 # Back
 
-<span class="highlight">Paris</span> is the capital of France.
+<span class="highlight">Paris</span> -> the capital of France.

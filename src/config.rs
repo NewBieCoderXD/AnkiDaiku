@@ -12,6 +12,7 @@ pub struct PackageJson {
 pub struct AnkiDaikuConfig {
   pub cards_dir: Option<String>,
   pub shared_css: Option<String>,
+  pub media_dir: Option<String>,
 }
 
 pub fn parse_package_json(root: &Path) -> Option<PackageJson> {

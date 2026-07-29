@@ -109,6 +109,100 @@ fn wrap_style(content: &str, style: &str) -> String {
   }
 }
 
+fn extract_media_paths(html: &str) -> Vec<String> {
+  let mut paths = Vec::new();
+  let bytes = html.as_bytes();
+  let len = bytes.len();
+  let mut i = 0;
+
+  while i < len {
+    if i + 4 <= len && &bytes[i..i + 4] == b"src=" {
+      i += 4;
+      while i < len && bytes[i] == b' ' {
+        i += 1;
+      }
+      if i < len && (bytes[i] == b'"' || bytes[i] == b'\'') {
+        let quote = bytes[i];
+        i += 1;
+        let start = i;
+        while i < len && bytes[i] != quote {
+          i += 1;
+        }
+        let path = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+        if !path.is_empty()
+          && !path.starts_with("http://")
+          && !path.starts_with("https://")
+          && !path.starts_with("data:")
+        {
+          paths.push(path.to_string());
+        }
+      }
+    } else {
+      i += 1;
+    }
+  }
+
+  paths
+}
+
+fn collect_media(
+  cards: &[Card],
+  media_dir: &Path,
+) -> Result<(HashMap<String, u32>, HashMap<i64, Vec<u8>>), Box<dyn std::error::Error>> {
+  let mut name_to_id: HashMap<String, u32> = HashMap::new();
+  let mut id_to_data: HashMap<i64, Vec<u8>> = HashMap::new();
+  let mut path_to_resolved: HashMap<String, String> = HashMap::new();
+  let mut resolved_to_id_name: HashMap<String, String> = HashMap::new();
+
+  for card in cards {
+    for html in [&card.front, &card.back] {
+      for path in extract_media_paths(html) {
+        let actual = media_dir.join(&path);
+
+        if !actual.exists() {
+          return Err(format!("Media file '{}' not found in '{}'", path, media_dir.display()).into());
+        }
+
+        let actual_str = actual.to_string_lossy().to_string();
+
+        if let Some(prev) = path_to_resolved.get(&path) {
+          if *prev != actual_str {
+            return Err(format!(
+              "Media collision: '{}' resolves to both '{}' and '{}'",
+              path, prev, actual_str
+            )
+            .into());
+          }
+          continue;
+        }
+
+        if let Some(existing_name) = resolved_to_id_name.get(&actual_str) {
+          path_to_resolved.insert(path.clone(), actual_str);
+          name_to_id.insert(path.clone(), name_to_id[existing_name]);
+          continue;
+        }
+
+        path_to_resolved.insert(path.clone(), actual_str.clone());
+        resolved_to_id_name.insert(actual_str, path.clone());
+
+        let data = fs::read(&actual)?;
+        let id = name_to_id.len() as u32;
+        name_to_id.insert(path.clone(), id);
+        id_to_data.insert(id as i64, data);
+      }
+    }
+  }
+
+  Ok((name_to_id, id_to_data))
+}
+
+fn resolve_media_dir(root: &Path, cfg: &Option<config::AnkiDaikuConfig>) -> std::path::PathBuf {
+  cfg.as_ref()
+    .and_then(|c| c.media_dir.as_ref())
+    .map(|d| root.join(d))
+    .unwrap_or_else(|| root.join("media"))
+}
+
 fn format_size(bytes: u64) -> String {
   if bytes < 1024 {
     format!("{} B", bytes)
@@ -279,6 +373,14 @@ pub fn export_apkg(
   let db_path = std::env::temp_dir().join(format!("anki_daiku_{}.db", timestamp_ms()));
   let shared_css = resolve_shared_css(root, &cfg);
   let css = combine_css(&shared_css);
+
+  let media_dir = resolve_media_dir(root, &cfg);
+  let (media_map, media_data) = collect_media(&cards, &media_dir)?;
+
+  let media_path_to_basename: HashMap<&str, &str> = media_map
+    .keys()
+    .map(|p| (p.as_str(), Path::new(p).file_name().unwrap().to_str().unwrap()))
+    .collect();
 
   {
     let conn = Connection::open(&db_path)?;
@@ -479,10 +581,16 @@ pub fn export_apkg(
       let card_id = note_id + 1;
       let guid = generate_guid(&card.deck, &card.id);
 
-      let wrapped_front = wrap_style(&card.front, &card.style);
-      let wrapped_back = wrap_style(&card.back, &card.style);
+      let front = media_path_to_basename
+        .iter()
+        .fold(card.front.clone(), |acc, (path, basename)| acc.replace(path, basename));
+      let back = media_path_to_basename
+        .iter()
+        .fold(card.back.clone(), |acc, (path, basename)| acc.replace(path, basename));
+      let wrapped_front = wrap_style(&front, &card.style);
+      let wrapped_back = wrap_style(&back, &card.style);
       let flds = format!("{}\x1f{}", wrapped_front, wrapped_back);
-      let sfld = card.front.clone();
+      let sfld = front.clone();
       let csum = checksum(&sfld);
       let tags = card.dependencies.join(" ");
 
@@ -529,9 +637,25 @@ pub fn export_apkg(
   zip.start_file("collection.anki2", options)?;
   zip.write_all(&db_bytes)?;
 
-  let media_json = serde_json::json!({});
-  zip.start_file("media", SimpleFileOptions::default())?;
-  zip.write_all(media_json.to_string().as_bytes())?;
+  for (id, data) in &media_data {
+    zip.start_file(id.to_string(), options)?;
+    zip.write_all(data)?;
+  }
+
+  let mut media_json: HashMap<String, String> = HashMap::new();
+  for (filename, id) in &media_map {
+    let basename = Path::new(filename)
+      .file_name()
+      .unwrap()
+      .to_str()
+      .unwrap()
+      .to_string();
+    media_json.insert(id.to_string(), basename);
+  }
+  let media_opts = SimpleFileOptions::default()
+    .compression_method(zip::CompressionMethod::Stored);
+  zip.start_file("media", media_opts)?;
+  zip.write_all(serde_json::to_string(&media_json)?.as_bytes())?;
 
   zip.finish()?;
 
@@ -544,8 +668,12 @@ pub fn export_apkg(
   let total = cards.len();
   let deleted_count = cards.iter().filter(|c| c.deleted).count();
   let active_count = total - deleted_count;
-  println!("Exported {} card(s) ({} active, {} deleted) to '{}' ({})",
-    total, active_count, deleted_count, output_path, format_size(file_size));
+  let media_count = media_data.len();
+  print!("Exported {} card(s) ({} active, {} deleted)", total, active_count, deleted_count);
+  if media_count > 0 {
+    print!(", {} media file(s)", media_count);
+  }
+  println!(" to '{}' ({})", output_path, format_size(file_size));
 
   let mut manifest: HashMap<String, String> = HashMap::new();
   for card in &cards {
