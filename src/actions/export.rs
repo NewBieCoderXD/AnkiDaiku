@@ -9,6 +9,7 @@ use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
 use super::build::{parse_dir, Card};
+use crate::config;
 
 const MODEL_ID: i64 = 1607392319;
 const DECK_ID: i64 = 1;
@@ -76,11 +77,61 @@ fn combine_css(cards: &[Card]) -> String {
   parts.join("\n\n")
 }
 
-pub fn export_apkg(dir_path: &str, output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-  let cards = parse_dir(&dir_path.to_string());
+fn resolve_cards_dir(root: &Path, cli_cards_dir: Option<&str>, config_cards_dir: Option<&str>) -> String {
+  if let Some(dir) = cli_cards_dir {
+    return root.join(dir).to_string_lossy().to_string();
+  }
+  if let Some(dir) = config_cards_dir {
+    return root.join(dir).to_string_lossy().to_string();
+  }
+  root.join("cards").to_string_lossy().to_string()
+}
+
+fn resolve_config(root: &Path, config_path: Option<&str>) -> Option<config::AnkiDaikuConfig> {
+  match config_path {
+    Some(path) => {
+      let p = Path::new(path);
+      if p.is_absolute() {
+        config::parse_config_path(p)
+      } else {
+        config::parse_config_path(&root.join(path))
+      }
+    }
+    None => config::parse_config(root),
+  }
+}
+
+fn deck_name(pkg: &Option<config::PackageJson>) -> String {
+  pkg.as_ref()
+    .and_then(|p| p.name.clone())
+    .unwrap_or_else(|| "AnkiDeck".to_string())
+}
+
+fn deck_desc(pkg: &Option<config::PackageJson>) -> String {
+  pkg.as_ref()
+    .and_then(|p| p.description.clone())
+    .unwrap_or_default()
+}
+
+pub fn export_apkg(
+  dir_path: &str,
+  output_path: &str,
+  cli_cards_dir: Option<&str>,
+  config_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let root = Path::new(dir_path);
+
+  let pkg = config::parse_package_json(root);
+  let cfg = resolve_config(root, config_path);
+  let cards_dir = resolve_cards_dir(root, cli_cards_dir, cfg.as_ref().and_then(|c| c.cards_dir.as_deref()));
+
+  let name = deck_name(&pkg);
+  let desc = deck_desc(&pkg);
+
+  let cards = parse_dir(&cards_dir);
 
   if cards.is_empty() {
-    eprintln!("No cards found in '{}'", dir_path);
+    eprintln!("No cards found in '{}'", cards_dir);
     return Ok(());
   }
 
@@ -160,7 +211,7 @@ pub fn export_apkg(dir_path: &str, output_path: &str) -> Result<(), Box<dyn std:
     let models_json = serde_json::json!({
       MODEL_ID.to_string(): {
         "id": MODEL_ID,
-        "name": "AnkiDaiku",
+        "name": &name,
         "type": 0,
         "mod": 0,
         "usn": -1,
@@ -206,7 +257,7 @@ pub fn export_apkg(dir_path: &str, output_path: &str) -> Result<(), Box<dyn std:
     let decks_json = serde_json::json!({
       DECK_ID.to_string(): {
         "id": DECK_ID,
-        "name": "AnkiDaiku",
+        "name": &name,
         "mod": 0,
         "usn": -1,
         "lrnToday": [0, 0],
@@ -215,7 +266,7 @@ pub fn export_apkg(dir_path: &str, output_path: &str) -> Result<(), Box<dyn std:
         "timeToday": [0, 0],
         "collapsed": false,
         "browserCollapsed": false,
-        "desc": "",
+        "desc": &desc,
         "dyn": 0,
         "conf": DCONF_ID,
         "extendNew": 0,
