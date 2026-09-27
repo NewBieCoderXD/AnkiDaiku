@@ -174,6 +174,27 @@ front matter can also use `{{prop}}`, e.g. `id: "{{word}}"`. Any card-level
 `# Widget` / `widget:` and `# Type` rules apply; `# Type` on a component can
 be `{{join(props, ", ")}}` and `# Widget` can show `{{answers}}`.
 
+### Fan-out: one card per record entry (`each:`)
+
+A component template can declare `each: <field>` in its front matter to render
+**one card per entry** of the record's list field (e.g. one card per example
+sentence). Great for drilling items individually:
+
+```yaml
+---
+deck: Synonyms
+each: syn_examples
+id: "{{#if ../syn_id}}{{../syn_id}}-{{n}}{{else}}syn-{{../word}}-{{n}}{{/if}}"
+---
+```
+
+- The innermost scope is each list entry (`{{the}}`, `{{syns}}`); `../` reaches
+  the record (`{{../word}}`, `{{../pos}}`).
+- `{{n}}` is the 1-based index of the entry, giving stable per-entry ids across
+  rebuilds.
+- The record's list field must exist and hold records (whole-record templates
+  are unaffected).
+
 ### Template expressions
 
 Component templates support a small fixed set of expressions (no arbitrary

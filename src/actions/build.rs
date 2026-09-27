@@ -87,6 +87,10 @@ pub struct ComponentTemplate {
   pub deck: String,
   pub id: String,
   pub widget: String,
+  /// When set to a list field on the record (e.g. `syn_examples`), the template
+  /// is rendered once per entry — the innermost scope is the entry (plus a
+  /// `n` = 1-based index), and `../` reaches the record.
+  pub each: String,
   pub body: String,
 }
 
@@ -670,6 +674,13 @@ fn apply_call(name: &str, args: &[serde_yaml::Value]) -> serde_yaml::Value {
     }
     "underline" => serde_yaml::Value::String(underline_word(&arg_str(0), &arg_str(1))),
     "replace" => serde_yaml::Value::String(replace_word(&arg_str(0), &arg_str(1), &arg_str(2))),
+    "lookup" => match args.first() {
+      Some(serde_yaml::Value::Mapping(m)) => m
+        .get(&serde_yaml::Value::String(arg_str(1)))
+        .cloned()
+        .unwrap_or(serde_yaml::Value::Null),
+      _ => serde_yaml::Value::Null,
+    },
     _ => serde_yaml::Value::Null,
   }
 }
@@ -701,6 +712,7 @@ fn parse_template_file(path: &Path) -> Option<ComponentTemplate> {
   let mut deck = String::new();
   let mut id = String::new();
   let mut widget = String::new();
+  let mut each = String::new();
   for line in matter.lines() {
     let line = line.trim();
     if let Some(v) = line.strip_prefix("deck:") {
@@ -709,6 +721,8 @@ fn parse_template_file(path: &Path) -> Option<ComponentTemplate> {
       id = v.trim().trim_matches('"').to_string();
     } else if let Some(v) = line.strip_prefix("widget:") {
       widget = v.trim().to_string();
+    } else if let Some(v) = line.strip_prefix("each:") {
+      each = v.trim().to_string();
     }
   }
 
@@ -723,6 +737,7 @@ fn parse_template_file(path: &Path) -> Option<ComponentTemplate> {
     deck,
     id,
     widget,
+    each,
     body: trimmed[body_start..].to_string(),
   })
 }
@@ -779,14 +794,13 @@ fn replace_word(text: &str, word: &str, replacement: &str) -> String {
   out
 }
 
-/// Render a component template against one data record to a Card.
-fn build_component_card(record: &serde_yaml::Value, tpl: &ComponentTemplate) -> Option<Card> {
-  let scope = vec![record.clone()];
-  let id = render_template(&tpl.id, &scope);
+/// Build the Card for `tpl` against an already-prepared scope.
+fn card_from_scope(tpl: &ComponentTemplate, scope: &Scope) -> Option<Card> {
+  let id = render_template(&tpl.id, scope);
   if id.is_empty() {
     return None;
   }
-  let body = render_template(&tpl.body, &scope);
+  let body = render_template(&tpl.body, scope);
   let (style, front, back, typed, answers, widget, extras) = split_sections(&body);
   if front.is_empty() && back.is_empty() {
     return None;
@@ -805,6 +819,31 @@ fn build_component_card(record: &serde_yaml::Value, tpl: &ComponentTemplate) -> 
     deck: tpl.deck.clone(),
     deleted: false,
   })
+}
+
+/// Render a component template against one data record to a Card. When the
+/// template declares `each: <field>`, one card is produced per entry of the
+/// record's field (inside the innermost scope: the entry plus `n`), so callers
+/// that want the full fan-out should use `build_component_cards` / the
+/// per-entry builder below.
+fn build_component_card(record: &serde_yaml::Value, tpl: &ComponentTemplate) -> Option<Card> {
+  card_from_scope(tpl, &vec![record.clone()])
+}
+
+/// The innermost scope for one entry of a template's `each` field: the entry
+/// record with `n` (1-based index) injected on top of the outer record.
+fn each_scope(record: &serde_yaml::Value, item: &serde_yaml::Value, n: usize) -> Option<Scope> {
+  let mut item = item.clone();
+  match &mut item {
+    serde_yaml::Value::Mapping(m) => {
+      m.insert(
+        serde_yaml::Value::String("n".to_string()),
+        serde_yaml::Value::Number((n as u64).into()),
+      );
+    }
+    _ => return None,
+  }
+  Some(vec![record.clone(), item])
 }
 
 /// Validate one record against the deck's schema declaration.
@@ -959,11 +998,42 @@ pub fn build_component_cards(
         Some(t) => t,
         None => return Err(format!("Unknown component '{}' for '{}'", name, label)),
       };
-      if let Some(card) = build_component_card(record, tpl) {
-        if !seen.insert((card.deck.clone(), card.id.clone())) {
-          return Err(format!("Duplicate card '{}::{}'", card.deck, card.id));
+
+      let mut push_card = |card: Option<Card>| -> Result<(), String> {
+        if let Some(card) = card {
+          if !seen.insert((card.deck.clone(), card.id.clone())) {
+            return Err(format!("Duplicate card '{}::{}'", card.deck, card.id));
+          }
+          cards.push(card);
         }
-        cards.push(card);
+        Ok(())
+      };
+
+      if tpl.each.is_empty() {
+        push_card(build_component_card(record, tpl))?;
+        continue;
+      }
+
+      // `each` template: one card per entry of the record's list field.
+      let entries = record
+        .get(&tpl.each)
+        .and_then(|v| v.as_sequence())
+        .ok_or_else(|| {
+          format!(
+            "Record '{}' has no list field '{}' for component '{}'",
+            label, tpl.each, name
+          )
+        })?;
+      for (i, item) in entries.iter().enumerate() {
+        let scope = each_scope(record, item, i + 1).ok_or_else(|| {
+          format!(
+            "Entry {} of '{}' for component '{}' must be a record",
+            i + 1,
+            tpl.each,
+            name
+          )
+        })?;
+        push_card(card_from_scope(tpl, &scope))?;
       }
     }
   }
@@ -1405,6 +1475,18 @@ components: [spelling, definitions, synonyms]",
   }
 
   #[test]
+  fn render_lookup_in_mapping() {
+    let out = render_true_value(
+      "syn_notes:\n  attain: by age or status\n  accomplish: by effort\nsyns: [attain, accomplish]",
+      "{{#each syns}}{{lookup(../syn_notes, this)}};{{/each}}",
+    );
+    assert_eq!(out, "by age or status;by effort;");
+    let out = render_true_value("syn_notes: {attain: x}\nsyns: [missing]",
+      "{{lookup(syn_notes, \"missing\")}}");
+    assert_eq!(out, "");
+  }
+
+  #[test]
   fn render_underline_and_replace() {
     let out = render_true_value("the: She worked hard to achieve her goals.\nword: achieve",
       "{{underline(the, word)}}");
@@ -1469,7 +1551,39 @@ components: [spelling, definitions, synonyms]",
       for comp in comps {
         let comp = comp.as_str().unwrap();
         let tpl = templates.get(comp).unwrap();
-        let rendered = build_component_card(record, tpl).unwrap();
+
+        // Render the same card set the build produces (incl. `each` fan-out).
+        let card: Option<Card> = if tpl.each.is_empty() {
+          build_component_card(record, tpl)
+        } else {
+          let entries = record.get(&tpl.each).unwrap().as_sequence().unwrap();
+          let mut first = None;
+          for (i, item) in entries.iter().enumerate() {
+            let scope = each_scope(record, item, i + 1).unwrap();
+            let c = card_from_scope(tpl, &scope).unwrap();
+            // Compare every drill card against cards/<deck>/<id>.md
+            let path = cards_dir.join(&tpl.deck).join(format!("{}.md", c.id));
+            if path.is_file() {
+              let handwritten_raw = fs::read_to_string(&path).unwrap();
+              let mut handwritten = parse_card(&handwritten_raw).unwrap();
+              handwritten.deck = tpl.deck.clone();
+              assert_eq!(
+                (c.id.clone(), c.deck.clone(), c.style.clone(), c.front.clone(), c.back.clone(), c.typed.clone(), c.extras.clone()),
+                (handwritten.id, handwritten.deck, handwritten.style, handwritten.front, handwritten.back, handwritten.typed, handwritten.extras),
+                "component mismatch for {}: {}",
+                record.get("word").unwrap().as_str().unwrap(),
+                c.id
+              );
+            }
+            first = Some(c);
+          }
+          first
+        };
+
+        let rendered = match card {
+          Some(c) => c,
+          None => continue,
+        };
         let word = record.get("word").unwrap().as_str().unwrap();
 
         // Build the path to the handwritten counterpart.
@@ -1505,6 +1619,7 @@ components: [spelling, definitions, synonyms]",
       deck: "Spelling".into(),
       id: "{{word}}".into(),
       widget: String::new(),
+      each: String::new(),
       body: "# Front\n\nQ\n\n---\n\n# Widget\n\n<div data-word=\"{{word}}\"></div>\n\n---\n\n# Type\n\n{{word}}\n\n---\n\n# Back\n\nA".into(),
     };
     let card = build_component_card(&record, &tpl).unwrap();
@@ -1520,6 +1635,7 @@ components: [spelling, definitions, synonyms]",
       deck: "Synonyms".into(),
       id: "{{word}}".into(),
       widget: String::new(),
+      each: String::new(),
       body: "# Front\n\nQ\n\n---\n\n# Type\n\n{{join(synonyms, \", \")}}\n\n---\n\n# Answers\n\n{{join(synonyms, \" / \")}}\n\n---\n\n# Back\n\nA".into(),
     };
     let card = build_component_card(&record, &tpl).unwrap();
@@ -1539,6 +1655,7 @@ components: [spelling, definitions, synonyms]",
       deck: "Spelling".into(),
       id: "{{word}}".into(),
       widget: String::new(),
+      each: String::new(),
       body: "# Front\n\n<div class=\"hint\">{{#if spelling_hint}}{{spelling_hint}}{{else}}{{letters(word)}} letters &middot; starts with <b>{{upper_first(word)}}</b> &middot; {{pos}}{{/if}}</div>\n\n---\n\n# Type\n\n{{word}}\n\n---\n\n# Back\n\nx".into(),
     };
     let card = build_component_card(&record, &tpl).unwrap();
@@ -1554,6 +1671,7 @@ components: [spelling, definitions, synonyms]",
       deck: "Spelling".into(),
       id: "{{word}}".into(),
       widget: String::new(),
+      each: String::new(),
       body: "# Front\n\n<div class=\"hint\">{{#if spelling_hint}}{{spelling_hint}}{{else}}{{letters(word)}} letters &middot; starts with <b>{{upper_first(word)}}</b> &middot; {{pos}}{{/if}}</div>\n\n---\n\n# Type\n\n{{word}}\n\n---\n\n# Back\n\nx".into(),
     };
     let card = build_component_card(&record, &tpl).unwrap();
@@ -1622,6 +1740,117 @@ components: [spelling, definitions, synonyms]",
     let mut seen = HashSet::new();
     let err = build_component_cards(&dir, &mut seen).unwrap_err();
     assert!(err.contains("Unknown component 'nope'"), "{}", err);
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn each_fanout_creates_one_card_per_entry() {
+    let dir = std::env::temp_dir().join(format!("ankidaiku_each_{}", std::process::id()));
+    fs::create_dir_all(dir.join("types")).unwrap();
+    fs::write(
+      dir.join("schema.yaml"),
+      "data: {file: data.yaml, list: words, components: components}\nrecord:\n  required: [word]\n  types:\n    syn_examples:\n      list:\n        - name: the\n        - name: syns\n          type: list\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("data.yaml"),
+      "words:\n  - {word: achieve, components: [synonyms], syn_examples: [{the: 'She aims to achieve it.', syns: [a]}, {the: 'We achieve results.', syns: [b, c]}, {the: 'You will achieve this.', syns: [d]}]}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("types").join("synonyms.html"),
+      "---\ndeck: Synonyms\neach: syn_examples\nid: \"syn-{{../word}}-{{n}}\"\n---\n\n# Front\n\n<p>{{underline(the, ../word)}}</p>\n\n---\n\n# Type\n\n{{join(syns, \", \")}}\n\n---\n\n# Back\n\nx",
+    )
+    .unwrap();
+    let mut seen = HashSet::new();
+    let cards = build_component_cards(&dir, &mut seen).unwrap();
+    assert_eq!(cards.len(), 3, "one card per syn_examples entry");
+    assert_eq!(cards[0].id, "syn-achieve-1");
+    assert_eq!(cards[1].id, "syn-achieve-2");
+    assert_eq!(cards[2].id, "syn-achieve-3");
+    assert_eq!(cards[0].typed, "a");
+    assert_eq!(cards[1].typed, "b, c");
+    assert!(cards[0].front.contains("<u>achieve</u>"), "{}", cards[0].front);
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn each_uses_syn_id_and_widget_answers_for_context() {
+    let dir = std::env::temp_dir().join(format!("ankidaiku_each2_{}", std::process::id()));
+    fs::create_dir_all(dir.join("types")).unwrap();
+    fs::write(
+      dir.join("schema.yaml"),
+      "data: {file: data.yaml, list: words, components: components}\nrecord:\n  required: [word]\n  types:\n    syn_examples:\n      list:\n        - name: the\n        - name: syns\n          type: list\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("data.yaml"),
+      "words:\n  - {word: good, syn_id: good, components: [synonyms], syn_examples: [{the: 'S1', syns: [effective]}, {the: 'S2', syns: [positive]}]}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("types").join("synonyms.html"),
+      "---\ndeck: Synonyms\neach: syn_examples\nid: \"{{#if ../syn_id}}{{../syn_id}}-{{n}}{{else}}syn-{{../word}}-{{n}}{{/if}}\"\n---\n\n# Front\n\n<p>{{underline(the, ../word)}}</p>\n\n---\n\n# Type\n\n{{join(syns, \", \")}}\n\n---\n\n# Answers\n\n{{join(syns, \" / \")}}\n\n---\n\n# Back\n\nx",
+    )
+    .unwrap();
+    let mut seen = HashSet::new();
+    let cards = build_component_cards(&dir, &mut seen).unwrap();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[0].id, "good-1");
+    assert_eq!(cards[1].id, "good-2");
+    assert_eq!(cards[0].typed, "effective");
+    assert_eq!(cards[0].answers, "effective");
+    assert_eq!(cards[1].answers, "positive");
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn each_missing_list_field_is_error() {
+    let dir = std::env::temp_dir().join(format!("ankidaiku_each_err_{}", std::process::id()));
+    fs::create_dir_all(dir.join("types")).unwrap();
+    fs::write(
+      dir.join("schema.yaml"),
+      "data: {file: data.yaml, list: words, components: components}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("data.yaml"),
+      "words:\n  - {word: one, components: [synonyms]}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("types").join("synonyms.html"),
+      "---\ndeck: D\neach: syn_examples\nid: \"{{../word}}-{{n}}\"\n---\n\n# Front\n\nQ\n\n---\n\n# Back\n\nA",
+    )
+    .unwrap();
+    let mut seen = HashSet::new();
+    let err = build_component_cards(&dir, &mut seen).unwrap_err();
+    assert!(err.contains("has no list field 'syn_examples'"), "{}", err);
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn each_entry_must_be_record() {
+    let dir = std::env::temp_dir().join(format!("ankidaiku_each_rec_{}", std::process::id()));
+    fs::create_dir_all(dir.join("types")).unwrap();
+    fs::write(
+      dir.join("schema.yaml"),
+      "data: {file: data.yaml, list: words, components: components}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("data.yaml"),
+      "words:\n  - {word: one, components: [synonyms], syn_examples: [just-a-string]}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("types").join("synonyms.html"),
+      "---\ndeck: D\neach: syn_examples\nid: \"{{../word}}-{{n}}\"\n---\n\n# Front\n\nQ\n\n---\n\n# Back\n\nA",
+    )
+    .unwrap();
+    let mut seen = HashSet::new();
+    let err = build_component_cards(&dir, &mut seen).unwrap_err();
+    assert!(err.contains("must be a record"), "{}", err);
     fs::remove_dir_all(&dir).unwrap();
   }
 }
