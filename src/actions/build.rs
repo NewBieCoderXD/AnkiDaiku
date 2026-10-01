@@ -310,7 +310,7 @@ type Scope = Vec<serde_yaml::Value>;
 /// Render `tpl` against `scope`: plain `{{path}}` substitution, `#if/#else/`
 /// blocks, `#each` loops over lists (with `../` for the outer record), and the
 /// small fixed function set `join`, `join_html`, `fallback`, `letters`,
-/// `upper_first`, `underline`, `replace`.
+/// `upper_first`, `underline`, `replace`, `without`, `merge`.
 fn render_template(tpl: &str, scope: &Scope) -> String {
   let tokens = tokenize_template(tpl);
   let mut i = 0usize;
@@ -440,17 +440,17 @@ fn render_nodes(nodes: &[Node], scope: &Scope) -> String {
         then,
         else_,
       } => {
-        if truthy(lookup_path(cond, scope)) {
+        if truthy_value(cond, scope) {
           out.push_str(&render_nodes(then, scope));
         } else {
           out.push_str(&render_nodes(else_, scope));
         }
       }
       Node::Each { key, body } => {
-        if let Some(seq) = lookup_path(key, scope).and_then(|v| v.as_sequence()) {
+        if let Some(serde_yaml::Value::Sequence(seq)) = each_seq(key, scope) {
           for item in seq {
             let mut sub = scope.to_vec();
-            sub.push(item.clone());
+            sub.push(item);
             out.push_str(&render_nodes(body, &sub));
           }
         }
@@ -458,6 +458,19 @@ fn render_nodes(nodes: &[Node], scope: &Scope) -> String {
     }
   }
   out
+}
+
+/// The list an `#each` walks: a path in scope, or the result of a call such as
+/// `merge(without(synonyms, syns), near)` — so a card can loop over a list that
+/// is computed rather than stored.
+fn each_seq(key: &str, scope: &Scope) -> Option<serde_yaml::Value> {
+  if let Some(seq) = lookup_path(key, scope).and_then(|v| v.as_sequence().cloned()) {
+    return Some(serde_yaml::Value::Sequence(seq));
+  }
+  match eval_expr_value(&parse_expr(key)?, scope) {
+    serde_yaml::Value::Sequence(seq) => Some(serde_yaml::Value::Sequence(seq)),
+    _ => None,
+  }
 }
 
 fn lookup_path<'a>(path: &str, scope: &'a Scope) -> Option<&'a serde_yaml::Value> {
@@ -484,6 +497,18 @@ fn truthy(v: Option<&serde_yaml::Value>) -> bool {
     Some(serde_yaml::Value::Mapping(m)) => !m.is_empty(),
     Some(serde_yaml::Value::Null) => false,
     Some(other) => !stringify(other).is_empty(),
+  }
+}
+
+/// Truthiness of a template condition: a path in scope, or the result of a call
+/// such as `{{#if merge(without(a, b), near)}}` — non-empty list = true.
+fn truthy_value(cond: &str, scope: &Scope) -> bool {
+  if let Some(v) = lookup_path(cond, scope) {
+    return truthy(Some(v));
+  }
+  match parse_expr(cond) {
+    Some(expr) => truthy(Some(&eval_expr_value(&expr, scope))),
+    None => false,
   }
 }
 
@@ -674,6 +699,8 @@ fn apply_call(name: &str, args: &[serde_yaml::Value]) -> serde_yaml::Value {
     }
     "underline" => serde_yaml::Value::String(underline_word(&arg_str(0), &arg_str(1))),
     "replace" => serde_yaml::Value::String(replace_word(&arg_str(0), &arg_str(1), &arg_str(2))),
+    "without" => without_values(&args),
+    "merge" => merge_values(&args),
     "lookup" => match args.first() {
       Some(serde_yaml::Value::Mapping(m)) => m
         .get(&serde_yaml::Value::String(arg_str(1)))
@@ -695,6 +722,54 @@ fn join_values(list: &serde_yaml::Value, base: &str, close: &str, sep: &str) -> 
     .map(|s| format!("{}{}{}", base, s, close))
     .collect::<Vec<_>>()
     .join(sep)
+}
+
+/// `without(head, exclude…)`: the items of the first list that appear in none of
+/// the other lists, as a list. Lets a card say which near-synonyms a given
+/// context *rejects* (`{{without(synonyms, syns, types)}}`) instead of only
+/// listing the ones it accepts. Matching is case- and space-insensitive.
+fn without_values(args: &[serde_yaml::Value]) -> serde_yaml::Value {
+  let mut excluded: Vec<String> = Vec::new();
+  for arg in args.iter().skip(1) {
+    excluded.extend(list_items(Some(arg)).iter().map(|s| item_key(s)));
+  }
+  serde_yaml::Value::Sequence(
+    list_items(args.first())
+      .into_iter()
+      .filter(|s| !excluded.contains(&item_key(s)))
+      .map(serde_yaml::Value::String)
+      .collect(),
+  )
+}
+
+/// `merge(a, b, …)`: the items of every list, de-duplicated in first-seen order.
+/// Pairs with `without` so a card can show rejected synonyms from several
+/// sources (family leftovers + curated near-misses) as one list.
+fn merge_values(args: &[serde_yaml::Value]) -> serde_yaml::Value {
+  let mut seen: Vec<String> = Vec::new();
+  let mut out: Vec<serde_yaml::Value> = Vec::new();
+  for arg in args {
+    for item in list_items(Some(arg)) {
+      let key = item_key(&item);
+      if !item.trim().is_empty() && !seen.contains(&key) {
+        seen.push(key);
+        out.push(serde_yaml::Value::String(item));
+      }
+    }
+  }
+  serde_yaml::Value::Sequence(out)
+}
+
+fn list_items(v: Option<&serde_yaml::Value>) -> Vec<String> {
+  match v {
+    Some(serde_yaml::Value::Sequence(seq)) => seq.iter().map(stringify).collect(),
+    Some(serde_yaml::Value::Null) | None => Vec::new(),
+    Some(other) => vec![stringify(other)],
+  }
+}
+
+fn item_key(s: &str) -> String {
+  s.trim().to_lowercase()
 }
 
 /// Parse a component template file (front matter with `deck:` and `id:`, then body).
@@ -1494,6 +1569,75 @@ components: [spelling, definitions, synonyms]",
     let out = render_true_value("the: I achieve my goals.\nword: achieve",
       "{{replace(the, word, \"reach\")}}");
     assert_eq!(out, "I reach my goals.");
+  }
+
+  #[test]
+  fn render_without_subtracts_every_exclude_list() {
+    // `without` returns a list, so it composes with `join*` and `#each`.
+    let out = render_true_value(
+      "synonyms: [essential, vital, intrinsic, indispensable]\nsyns: [essential, vital, intrinsic]\ntypes: [indispensable]",
+      "{{join(without(synonyms, syns, types), \", \")}}",
+    );
+    assert_eq!(out, "");
+    let out = render_true_value(
+      "synonyms: [Essential, Vital, Key]\nsyns: [vital]",
+      "{{join(without(synonyms, syns), \", \")}}",
+    );
+    assert_eq!(out, "Essential, Key");
+    let out = render_true_value("synonyms: [a, b]\nsyns: [a]", "{{join(without(synonyms, syns, missing), \", \")}}");
+    assert_eq!(out, "b");
+  }
+
+  #[test]
+  fn render_merge_concatenates_and_dedupes() {
+    let out = render_true_value(
+      "leftover: [key, indispensable]\nnear: [imperative, key]\nempty: []",
+      "{{#each merge(leftover, near, empty)}}[{{this}}]{{/each}}",
+    );
+    assert_eq!(out, "[key][indispensable][imperative]");
+  }
+
+  #[test]
+  fn each_accepts_a_call_result() {
+    let out = render_true_value(
+      "synonyms: [a, b, c]\nsyns: [b]\nnear: [d]",
+      "{{#each merge(without(synonyms, syns), near)}}{{this}};{{/each}}",
+    );
+    assert_eq!(out, "a;c;d;");
+  }
+
+  #[test]
+  fn if_accepts_a_call_result() {
+    let out = render_true_value(
+      "synonyms: [a, b]\nsyns: [a, b]",
+      "{{#if merge(without(synonyms, syns), near)}}yes{{else}}no{{/if}}",
+    );
+    assert_eq!(out, "no");
+    let out = render_true_value(
+      "synonyms: [a, b]\nsyns: [a]",
+      "{{#if merge(without(synonyms, syns), near)}}yes{{else}}no{{/if}}",
+    );
+    assert_eq!(out, "yes");
+  }
+
+  #[test]
+  fn per_record_note_overrides_the_shared_note() {
+    // A record may carry its own reason for a rejected word; anything it does not
+    // mention falls back to the note on the parent record, so one word can be
+    // explained differently in each context that rejects it.
+    let yaml = concat!(
+      "word: chance\n",
+      "rejects: [a, b]\n",
+      "syn_avoid: {a: shared-a, b: shared-b}\n",
+      "list:\n",
+      "  - {the: One, avoid: {a: for-one}}\n",
+      "  - {the: Two}\n",
+    );
+    let out = render_true_value(
+      yaml,
+      "{{#each list}}{{#each ../rejects}}[{{this}}={{#if lookup(../avoid, this)}}{{lookup(../avoid, this)}}{{else}}{{lookup(../../syn_avoid, this)}}{{/if}}]{{/each}};{{/each}}",
+    );
+    assert_eq!(out, "[a=for-one][b=shared-b];[a=shared-a][b=shared-b];");
   }
 
   #[test]
