@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 type FrontCard = String;
@@ -21,12 +21,133 @@ pub struct PipelineSchema {
 
 #[derive(Debug, Deserialize)]
 pub struct DataSpec {
-  /// Data file relative to the cards dir.
-  pub file: String,
+  /// Single data file relative to the cards dir. Shorthand for a one-element
+  /// `files` list; cannot be combined with it.
+  #[serde(default)]
+  pub file: Option<String>,
+  /// Data files relative to the cards dir, concatenated in order. Each entry may
+  /// be a plain path or a glob with `*` (matched inside one directory) or `**`
+  /// (any depth, as `**/*.yaml`); matches are sorted, so `words/*.yaml` reads
+  /// a.sh before b.sh and the card order is deterministic.
+  #[serde(default)]
+  pub files: Option<Vec<String>>,
   /// Root key holding the list of records.
   pub list: String,
   /// Field on each record listing which component templates to fan out to.
   pub components: String,
+}
+
+impl DataSpec {
+  /// The configured patterns, with the single-file shorthand normalised away.
+  pub fn patterns(&self) -> Vec<String> {
+    if let Some(files) = &self.files {
+      files.clone()
+    } else if let Some(file) = &self.file {
+      vec![file.clone()]
+    } else {
+      Vec::new()
+    }
+  }
+}
+
+/// Expand one data-file pattern against `base`, returning matching files sorted.
+/// A pattern with no `*` must exist exactly; glob patterns are matched against
+/// the path relative to `base` using `/` separators.
+fn expand_data_pattern(base: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> {
+  if !pattern.contains('*') {
+    let path = base.join(pattern);
+    if !path.is_file() {
+      return Err(format!("data file '{}' is missing", path.display()));
+    }
+    return Ok(vec![path]);
+  }
+
+  let mut matches = Vec::new();
+  collect_matches(base, base, pattern, &mut matches);
+  if matches.is_empty() {
+    return Err(format!("data pattern '{}' matches no files under '{}'", pattern, base.display()));
+  }
+  matches.sort();
+  Ok(matches)
+}
+
+/// Collect files under `dir` whose path relative to `root` matches `pattern`.
+/// The whole tree is walked and each file is tested, so `*` (which never spans
+/// a `/`) still keeps a pattern like `words/*.yaml` to a single directory.
+fn collect_matches(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
+  let entries = match fs::read_dir(dir) {
+    Ok(entries) => entries,
+    Err(_) => return,
+  };
+  for entry in entries.flatten() {
+    let path = entry.path();
+    let relative = path
+      .strip_prefix(root)
+      .unwrap_or(&path)
+      .to_string_lossy()
+      .replace('\\', "/");
+    if path.is_dir() {
+      collect_matches(root, &path, pattern, out);
+      continue;
+    }
+    if glob_match(pattern, &relative) {
+      out.push(path);
+    }
+  }
+}
+
+/// Minimal glob matcher over `/`-separated paths: `?` is one non-separator
+/// character, `*` is any run that stops at a `/`, `**` is any run including
+/// separators, so `words/*.yaml` reads one directory and `words/**/*.yaml`
+/// reads any depth.
+fn glob_match(pattern: &str, text: &str) -> bool {
+  let p: Vec<char> = pattern.chars().collect();
+  let t: Vec<char> = text.chars().collect();
+  // memo[i][j] = pattern[i..] matches text[j..]
+  let mut memo = vec![vec![false; t.len() + 1]; p.len() + 1];
+  memo[p.len()][t.len()] = true;
+  for i in (0..p.len()).rev() {
+    for j in (0..=t.len()).rev() {
+      memo[i][j] = if p[i] == '?' && j < t.len() && t[j] != '/' {
+        memo[i + 1][j + 1]
+      } else if p[i] == '*' {
+        if p.get(i + 1) == Some(&'*') {
+          // `**` spans separators, and `**/` may also match no directory at all
+          // (so `a/**/*.yaml` matches `a/b.yaml` as well as `a/x/b.yaml`).
+          let mut ok = memo[i + 2][j];
+          if p.get(i + 2) == Some(&'/') {
+            ok = ok || memo[i + 3][j] || memo[i + 1][j];
+          }
+          ok || (j < t.len() && memo[i][j + 1])
+        } else {
+          memo[i + 1][j] || (j < t.len() && t[j] != '/' && memo[i][j + 1])
+        }
+      } else {
+        j < t.len() && p[i] == t[j] && memo[i + 1][j + 1]
+      };
+    }
+  }
+  memo[0][0]
+}
+
+/// Read every configured data file and concatenate the records of their `list`
+/// key, so a deck can spread its records over as many files as it likes.
+pub fn load_records(cards_dir: &Path, schema: &DataSpec) -> Result<Vec<serde_yaml::Value>, String> {
+  let mut records = Vec::new();
+  for pattern in schema.patterns() {
+    for path in expand_data_pattern(cards_dir, &pattern)? {
+      let content = fs::read_to_string(&path)
+        .map_err(|e| format!("Error reading '{}': {}", path.display(), e))?;
+      let root: serde_yaml::Value = serde_yaml::from_str(&content)
+        .map_err(|e| format!("Error parsing '{}': {}", path.display(), e))?;
+      let list = root
+        .get(&schema.list)
+        .and_then(|v| v.as_sequence())
+        .ok_or_else(|| format!("'{}' has no list key '{}'", path.display(), schema.list))?;
+      records.extend(list.iter().cloned());
+    }
+  }
+  Ok(records)
 }
 
 fn default_templates_dir() -> String {
@@ -1007,22 +1128,16 @@ pub fn build_component_cards(
   let schema: PipelineSchema = serde_yaml::from_str(&content)
     .map_err(|e| format!("Error parsing '{}': {}", schema_path.display(), e))?;
 
-  let data_path = cards_dir.join(&schema.data.file);
-  if !data_path.is_file() {
+  let data_patterns = schema.data.patterns();
+  if data_patterns.is_empty() {
     return Err(format!(
-      "Schema '{}' declares data file '{}' which is missing",
-      schema_path.display(),
-      schema.data.file
+      "Schema '{}' declares no data file (set `file:` or `files:`)",
+      schema_path.display()
     ));
   }
-  let content = fs::read_to_string(&data_path)
-    .map_err(|e| format!("Error reading '{}': {}", data_path.display(), e))?;
-  let root: serde_yaml::Value = serde_yaml::from_str(&content)
-    .map_err(|e| format!("Error parsing '{}': {}", data_path.display(), e))?;
-  let records = root
-    .get(&schema.data.list)
-    .and_then(|v| v.as_sequence())
-    .ok_or_else(|| format!("'{}' has no list key '{}'", data_path.display(), schema.data.list))?;
+  let records = load_records(cards_dir, &schema.data)
+    .map_err(|e| format!("Schema '{}': {}", schema_path.display(), e))?;
+  let records = &records;
 
   let types_dir = cards_dir.join(&schema.templates_dir);
   if !types_dir.is_dir() {
@@ -1682,15 +1797,12 @@ components: [spelling, definitions, synonyms]",
       }
     }
 
-    let data_path = cards_dir.join(&schema.data.file);
-    if !data_path.is_file() {
-      return;
-    }
-    let root: serde_yaml::Value =
-      serde_yaml::from_str(&fs::read_to_string(&data_path).unwrap()).unwrap();
-    let records = root.get(&schema.data.list).unwrap().as_sequence().unwrap();
+    let records = match load_records(&cards_dir, &schema.data) {
+      Ok(records) => records,
+      Err(_) => return,
+    };
 
-    for record in records {
+    for record in &records {
       let comps = record.get(&schema.data.components).unwrap().as_sequence().unwrap();
       for comp in comps {
         let comp = comp.as_str().unwrap();
@@ -1847,6 +1959,117 @@ components: [spelling, definitions, synonyms]",
     assert_eq!(cards[0].id, "one");
     assert_eq!(cards[0].typed, "a, b");
     assert_eq!(cards[1].id, "two");
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn schema_records_from_many_files() {
+    let dir = std::env::temp_dir().join(format!("ankidaiku_multi_{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("types")).unwrap();
+    fs::create_dir_all(dir.join("words")).unwrap();
+    // Two `files:` entries, one of them a glob, read in sorted path order.
+    fs::write(
+      dir.join("schema.yaml"),
+      "data:\n  files: [extra.yaml, \"words/*.yaml\"]\n  list: words\n  components: components\nrecord:\n  required: [word]\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("extra.yaml"),
+      "words:\n  - {word: last, components: [spelling]}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("words").join("a.yaml"),
+      "words:\n  - {word: one, components: [spelling]}\n",
+    )
+    .unwrap();
+    fs::write(
+      dir.join("words").join("b.yaml"),
+      "words:\n  - {word: two, components: [spelling]}\n",
+    )
+    .unwrap();
+    // A file that the glob does not match must be ignored.
+    fs::write(dir.join("words").join("notes.md"), "ignore me").unwrap();
+    fs::write(
+      dir.join("types").join("spelling.html"),
+      "---\ndeck: Spelling\nid: \"{{word}}\"\n---\n\n# Front\n\n{{word}}\n\n---\n\n# Type\n\n{{word}}\n\n---\n\n# Back\n\nx",
+    )
+    .unwrap();
+
+    let schema: PipelineSchema =
+      serde_yaml::from_str(&fs::read_to_string(dir.join("schema.yaml")).unwrap()).unwrap();
+    assert_eq!(schema.data.patterns(), vec!["extra.yaml", "words/*.yaml"]);
+    let records = load_records(&dir, &schema.data).unwrap();
+    let words: Vec<String> = records
+      .iter()
+      .map(|r| r.get("word").unwrap().as_str().unwrap().to_string())
+      .collect();
+    assert_eq!(words, vec!["last", "one", "two"]);
+
+    let mut seen = HashSet::new();
+    let cards = build_component_cards(&dir, &mut seen).unwrap();
+    assert_eq!(cards.len(), 3);
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn schema_recursive_glob_matches_nested_files() {
+    let dir = std::env::temp_dir().join(format!("ankidaiku_glob_{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("words").join("b2")).unwrap();
+    fs::create_dir_all(dir.join("words").join("a1")).unwrap();
+    fs::write(
+      dir.join("words").join("a1").join("one.yaml"),
+      "words:\n  - {word: nested}\n",
+    )
+    .unwrap();
+    fs::write(dir.join("words").join("top.yaml"), "words:\n  - {word: top}\n").unwrap();
+    fs::write(
+      dir.join("words").join("b2").join("skip.txt"),
+      "not yaml",
+    )
+    .unwrap();
+
+    let schema: PipelineSchema = serde_yaml::from_str(
+      "data: {files: [\"words/**/*.yaml\"], list: words, components: components}\n",
+    )
+    .unwrap();
+    let records = load_records(&dir, &schema.data).unwrap();
+    let words: Vec<String> = records
+      .iter()
+      .map(|r| r.get("word").unwrap().as_str().unwrap().to_string())
+      .collect();
+    assert_eq!(words, vec!["nested", "top"]);
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn glob_matching_rules() {
+    assert!(glob_match("*.yaml", "a.yaml"));
+    assert!(!glob_match("*.yaml", "a.yml"));
+    assert!(!glob_match("*.yaml", "sub/a.yaml"));
+    assert!(glob_match("**/*.yaml", "a.yaml"));
+    assert!(glob_match("**/*.yaml", "sub/a.yaml"));
+    assert!(glob_match("a?c.yaml", "abc.yaml"));
+    assert!(!glob_match("a?c.yaml", "ac.yaml"));
+    assert!(glob_match("a*", "a"));
+    assert!(!glob_match("*.yaml", "yaml"));
+  }
+
+  #[test]
+  fn schema_missing_data_file_is_an_error() {
+    let dir = std::env::temp_dir().join(format!("ankidaiku_nodata_{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("types")).unwrap();
+    fs::write(
+      dir.join("schema.yaml"),
+      "data: {files: [\"words/*.yaml\"], list: words, components: components}\n",
+    )
+    .unwrap();
+    let mut seen = HashSet::new();
+    let err = build_component_cards(&dir, &mut seen).unwrap_err();
+    assert!(err.contains("matches no files"), "{}", err);
     fs::remove_dir_all(&dir).unwrap();
   }
 

@@ -145,7 +145,10 @@ schema file instead of hardcoding record shapes in the builder. When
 `cards/schema.yaml` (or `schema.yml`) exists, it is auto-detected:
 
 ```yaml
-data: { file: words.yaml, list: words, components: components }
+data:
+  files: ["words/*.yaml"]
+  list: words
+  components: components
 templates_dir: types
 record:
   required: [word, ipa, definition]
@@ -158,9 +161,14 @@ record:
           type: list
 ```
 
-- `data` — which YAML/JSON/TSV file holds the records, and which top-level
-  keys name the plain records (`list`) and the component records
-  (`components`; each entry links back to a list record via `link`).
+- `data.files` — which YAML/JSON/TSV files hold the records: any number of
+  paths or globs, all concatenated. `*` stays inside one directory, `**` spans
+  directories, matches are sorted so the card order is deterministic, and a
+  pattern matching nothing is a build error (usually a typo). `data.file` is
+  accepted as a one-file shorthand.
+- `data.list` / `data.components` — which top-level key holds the records, and
+  the field on each record listing the component templates to fan out to (each
+  entry links back to a list record via `link`).
 - `templates_dir` — where the `types/*.html` component templates live.
 - `record.required` — missing / empty (or missing-component) fields fail the
   build. Unknown fields are allowed; unlisted optional fields default to empty.
